@@ -224,8 +224,8 @@ test_list = []
 
 
 for epoch in range(args.epochs):
-    loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
-    losses.append(loss)
+    #loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
+    #losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
     valid_results = eval(model, graph, valid_pos_edge, valid_neg_edge, evaluator, pred)

@@ -126,8 +126,6 @@ def test(model, g, pos_test_edge, neg_test_edge, evaluator, pred, neg_g):
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
             neg_score.append(neg_pred)
         neg_score = torch.cat(neg_score, dim=0)
-        pos_score = torch.reshape(pos_score, (pos_score.size(0), 1))
-        neg_score = torch.reshape(neg_score, (neg_score.size(0), 1))
         results = {}
         results[args.metric] = evaluator.eval({
             'y_pred_pos': pos_score,
@@ -155,8 +153,6 @@ def eval(model, g, pos_valid_edge, neg_valid_edge, evaluator, pred, neg_g):
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
             neg_score.append(neg_pred)
         neg_score = torch.cat(neg_score, dim=0)
-        pos_score = torch.reshape(pos_score, (pos_score.size(0), 1))
-        neg_score = torch.reshape(neg_score, (neg_score.size(0), 1))
         results = {}
         results[args.metric] = evaluator.eval({
             'y_pred_pos': pos_score,
@@ -171,7 +167,7 @@ split_edge = dataset.get_edge_split()
 device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
 
 graph = dataset[0]
-#graph = dgl.add_self_loop(graph)
+graph = dgl.add_self_loop(graph)
 graph = dgl.to_bidirected(graph, copy_ndata=True).to(device)
 
 train_pos_edge = split_edge['train']['edge'].to(device)
@@ -199,8 +195,6 @@ elif args.model == 'GCN_no_para':
 parameter = itertools.chain(model.parameters(), pred.parameters(), embedding.parameters())
 optimizer = torch.optim.Adam(parameter, lr=args.lr)
 evaluator = Evaluator(name=args.dataset)
-if args.dataset != 'ogbl-citation2':
-    evaluator.K = args.k
 
 best_val = 0
 final_test_result = None
