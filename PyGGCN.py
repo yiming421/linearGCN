@@ -7,10 +7,68 @@ from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 from torch_geometric.utils import negative_sampling
 import time
 from torch_geometric.nn import GCNConv
-from torch.optim import lr_scheduler
 import itertools
 from torch_geometric.utils import add_self_loops, to_undirected
 from torch_sparse import SparseTensor
+import torch_sparse
+from util import adjoverlap
+
+class NCNPredictor(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 hidden_channels,
+                 out_channels,
+                 dropout,
+                 use_xlin=False,
+                 tailact=False,
+                 twolayerlin=False,
+                 beta = 1.0,
+                 res = 0.0):
+        super().__init__()
+
+        self.beta = beta
+        self.res = res
+
+        self.xlin = nn.Sequential(nn.Linear(hidden_channels, hidden_channels),
+            nn.Dropout(dropout, inplace=True), nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, hidden_channels)) if use_xlin else lambda x: 0
+
+        self.xcnlin = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.Dropout(dropout, inplace=True), nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.Dropout(dropout, inplace=True),
+            nn.ReLU(inplace=True), nn.Linear(hidden_channels, hidden_channels) if not tailact else nn.Identity())
+        self.xijlin = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.Dropout(dropout, inplace=True), nn.ReLU(inplace=True),
+            nn.Linear(hidden_channels, hidden_channels) if not tailact else nn.Identity())
+        self.lin = nn.Sequential(nn.Linear(hidden_channels, hidden_channels),
+                                 nn.Dropout(dropout, inplace=True),
+                                 nn.ReLU(inplace=True),
+                                 nn.Linear(hidden_channels, hidden_channels) if twolayerlin else nn.Identity(),
+                                 nn.Dropout(dropout, inplace=True) if twolayerlin else nn.Identity(),
+                                 nn.ReLU(inplace=True) if twolayerlin else nn.Identity(),
+                                 nn.Linear(hidden_channels, out_channels))
+
+    def multidomainforward(self,
+                           x,
+                           adj,
+                           tar_ei):
+        xi = x[tar_ei[0]]
+        xj = x[tar_ei[1]]
+        x = self.res * x + self.xlin(x)
+        cn = adjoverlap(adj, adj, tar_ei)
+        xcns = [torch_sparse.spmm_add(cn, x)]
+        xij = self.xijlin(xi * xj)
+        
+        xs = torch.cat(
+            [self.lin(self.xcnlin(xcn) * self.beta + xij) for xcn in xcns],
+            dim=-1)
+        return xs
+
+    def forward(self, x, adj, tar_ei):
+        return self.multidomainforward(x, adj, tar_ei)
 
 def adjustlr(optimizer, decay_ratio, lr):
     lr_ = lr * max(1 - decay_ratio, 0.0001)
@@ -71,7 +129,7 @@ def train(model,
 
     total_loss = []
     loader = torch.utils.data.DataLoader(range(pos_train_edge.shape[1]), batch_size=batch_size, shuffle=True)
-    neg_edge = negative_sampling(data.edge_index, data.num_nodes, num_neg_samples=args.neg * pos_train_edge.shape[1])
+    neg_edge = negative_sampling(data.edge_index, data.num_nodes, num_neg_samples=args.num_neg * pos_train_edge.shape[1])
     for perm in loader:
         optimizer.zero_grad()
         h = model(data.x, data.adj)
@@ -109,7 +167,7 @@ def test(model, predictor, data, split_edge, evaluator, batch_size,
     pos_test_edge = split_edge['test']['edge'].to(data.adj.device())
     neg_test_edge = split_edge['test']['edge_neg'].to(data.adj.device())
 
-    h = model(data.x, data.adj)
+    h = model(data.x, data.edge_index)
     pos_train_pred = []
     loader = torch.utils.data.DataLoader(range(pos_train_edge.shape[0]), batch_size=batch_size, shuffle=False)
     for perm in loader:
@@ -182,7 +240,7 @@ def parseargs():
     parser.add_argument('--epochs', type=int, default=100, help="number of epochs")
     parser.add_argument('--dataset', type=str, default="ogbl-collab")
     parser.add_argument('--batch_size', type=int, default=8192, help="batch size")
-    parser.add_argument('--layers', type=int, default=1, help="layers")
+    parser.add_argument('--prop_step', type=int, default=1, help="layers")
     parser.add_argument('--hidden', type=int, default=32, help="hidden dimension")
     parser.add_argument('--residual', type=float, default=0, help="residual connection rate")
     parser.add_argument('--dropout', type=float, default=0.3, help="dropout ratio")
@@ -190,13 +248,19 @@ def parseargs():
     parser.add_argument('--gpu', type=int, default=0, help="gpu id")
     parser.add_argument('--num_neg', type=int, default=1, help="number of negative samples")
     parser.add_argument('--seed', type=int, default=0, help="random seed")
+    parser.add_argument('--predictor', type=str, default="hadamard", help="predictor")
+    parser.add_argument('--use_xlin', action='store_true', default=False, help="use xlin")
+    parser.add_argument('--tailact', action='store_true', default=False, help="use tailact")
+    parser.add_argument('--twolayerlin', action='store_true', default=False, help="use twolayerlin")
+    parser.add_argument('--beta', type=float, default=1.0, help="beta")
+    
     args = parser.parse_args()
     return args
 
 
 def main():
     args = parseargs()
-    #print(args, flush=True)
+    print(args, flush=True)
 
     evaluator = Evaluator(name=args.dataset)
 
@@ -205,16 +269,16 @@ def main():
     data = dataset[0]
     data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.edge_index = to_undirected(data.edge_index)
-    data.adj = SparseTensor(row=data.edge_index[0], col=data.edge_index[1])
+    data.adj = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+    data.adj = data.adj.to_symmetric().coalesce()
     split_edge = dataset.get_edge_split()
-    data.neg = negative_sampling(data.edge_index.to(device), data.num_nodes, num_neg_samples=args.num_neg * split_edge['train']['edge'].shape[1])
     data = data.to(device)
-    if args.data == 'ogbl-collab':
+    if args.dataset == 'ogbl-collab':
         val_edge_index = split_edge['valid']['edge'].t()
         full_edge_index = torch.cat([data.edge_index, val_edge_index], dim=-1)
         full_edge_index = add_self_loops(full_edge_index, num_nodes=data.num_nodes)[0]
-        full_edge_index = to_undirected(full_edge_index)
-        data.full_adj = SparseTensor(row=full_edge_index[0], col=full_edge_index[1])
+        data.full_adj = SparseTensor.from_edge_index(full_edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+        data.full_adj = data.full_adj.to_symmetric().coalesce()
     else:
         data.full_adj = data.adj
 
@@ -227,7 +291,10 @@ def main():
     else:
         embedding = None
 
-    predictor = Hadamard_MLPPredictor(args.hidden, args.dropout).to(device)
+    if args.predictor == 'hadamard':
+        predictor = Hadamard_MLPPredictor(args.hidden, args.dropout).to(device)
+    elif args.predictor == 'ncn':
+        raise(NotImplementedError)
     
     ret = []
 
@@ -236,7 +303,7 @@ def main():
     bestepoch = 0
     
     # build model
-    model = GCN(data.num_features, args.hidden, args.layers, args.residual).to(device) 
+    model = GCN(data.x.shape[1], args.hidden, args.prop_step, args.residual).to(device) 
         
     if args.dataset == "ogbl-ddi" or args.dataset == "ogbl-ppa":
         parameter = itertools.chain(model.parameters(), predictor.parameters(), embedding.parameters())
