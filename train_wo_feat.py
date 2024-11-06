@@ -7,17 +7,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ogb.linkproppred import DglLinkPropPredDataset, Evaluator
-from dgl.dataloading.negative_sampler import GlobalUniform, PerSourceUniform
+from dgl.dataloading.negative_sampler import GlobalUniform
 from torch.utils.data import DataLoader
 import tqdm
 import argparse
 from loss import auc_loss, hinge_auc_loss, log_rank_loss
-from model import Hadamard_MLPPredictor, GCN, GCN_with_MLP, GCN_no_para
+from model import Hadamard_MLPPredictor, GCN, GCN_with_MLP, GCN_no_para, GCN_with_feature, DotPredictor, LorentzPredictor
+import matplotlib.pyplot as plt
 
 def parse():
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default='ogbl-ddi', choices=['ogbl-ddi', 'ogbl-ppa'], type=str)
+    parser.add_argument("--dataset", default='ogbl-ddi', choices=['ogbl-ddi', 'ogbl-ppa', 'ogbl-collab'], type=str)
     parser.add_argument("--lr", default=0.01, type=float)
     parser.add_argument("--prop_step", default=8, type=int)
     parser.add_argument("--hidden", default=32, type=int)
@@ -31,7 +32,7 @@ def parse():
     parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--relu", action='store_true', default=False)
     parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--model", default='GCN', choices=['GCN', 'GCN_with_MLP', 'GCN_no_para'], type=str)
+    parser.add_argument("--model", default='GCN', choices=['GCN', 'GCN_with_feature', 'GCN_with_MLP', 'GCN_no_para'], type=str)
     parser.add_argument("--maskinput", action='store_true', default=False)
     parser.add_argument("--norm", action='store_true', default=False)
     parser.add_argument("--dp4norm", default=0, type=float)
@@ -39,7 +40,10 @@ def parse():
     parser.add_argument("--drop_edge", action='store_true', default=False)
     parser.add_argument("--loss", default='bce', choices=['bce', 'auc', 'hauc', 'rank'], type=str)
     parser.add_argument("--residual", default=0, type=float)
-    parser.add_argument("--K", default=0, type=int)
+    parser.add_argument('--mlp_layers', type=int, default=2)
+    parser.add_argument('--mlp_res', action='store_true', default=False)
+    parser.add_argument('--conv', default='GCN', choices=['GCN', 'GAT', 'GIN', 'SAGE'], type=str)
+    parser.add_argument('--pred', default='Hadamard', choices=['Hadamard', 'Dot', 'Lorentz'], type=str)
 
     args = parser.parse_args()
     return args
@@ -56,7 +60,7 @@ def adjustlr(optimizer, decay_ratio, lr):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr_
 
-def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, neg_g):
+def train(model, g, train_pos_edge, optimizer, neg_sampler, pred):
     model.train()
     pred.train()
 
@@ -72,17 +76,18 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, neg_g):
             re_tei = torch.stack((dst, src), dim=0).t()
             tei = torch.cat((tei, re_tei), dim=0)
             g_mask = dgl.graph((tei[:, 0], tei[:, 1]), num_nodes=g.num_nodes())
-            g_mask.add_self_loop(g_mask)
-            h = model(g_mask, g.ndata['feat'], neg_g)
+            g_mask = dgl.add_self_loop(g_mask)
+            h = model(g_mask, g.ndata['feat'])
             mask[edge_index] = 1
         else:
-            h = model(g, g.ndata['feat'], neg_g)
+            h = model(g, g.ndata['feat'])
 
         pos_edge = train_pos_edge[edge_index]
         neg_train_edge = neg_sampler(g, pos_edge.t()[0])
         neg_train_edge = torch.stack(neg_train_edge, dim=0)
         neg_train_edge = neg_train_edge.t()
         neg_edge = neg_train_edge
+
         pos_score = pred(h[pos_edge[:,0]], h[pos_edge[:,1]])
         neg_score = pred(h[neg_edge[:,0]], h[neg_edge[:,1]])
         if args.loss == 'auc':
@@ -96,7 +101,7 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, neg_g):
         
         optimizer.zero_grad()
         loss.backward()
-        if args.dataset == 'ogbl-ddi':
+        if args.dataset == 'ogbl-ddi' or args.dataset == 'ogbl-collab':
             torch.nn.utils.clip_grad_norm_(g.ndata['feat'], 1.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
@@ -105,12 +110,12 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, neg_g):
 
     return total_loss / len(dataloader)
 
-def test(model, g, pos_test_edge, neg_test_edge, evaluator, pred, neg_g):
+def test(model, g, pos_test_edge, neg_test_edge, evaluator, pred):
     model.eval()
     pred.eval()
 
     with torch.no_grad():
-        h = model(g, g.ndata['feat'], neg_g)
+        h = model(g, g.ndata['feat'])
         dataloader = DataLoader(range(pos_test_edge.size(0)), args.batch_size)
         pos_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -132,12 +137,12 @@ def test(model, g, pos_test_edge, neg_test_edge, evaluator, pred, neg_g):
         })[args.metric]
     return results
 
-def eval(model, g, pos_valid_edge, neg_valid_edge, evaluator, pred, neg_g):
+def eval(model, g, pos_valid_edge, neg_valid_edge, evaluator, pred):
     model.eval()
     pred.eval()
 
     with torch.no_grad():
-        h = model(g, g.ndata['feat'], neg_g)
+        h = model(g, g.ndata['feat'])
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
         pos_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -159,15 +164,15 @@ def eval(model, g, pos_valid_edge, neg_valid_edge, evaluator, pred, neg_g):
         })[args.metric]
     return results
 
-# Load the dataset
+# Load the dataset 
 dataset = DglLinkPropPredDataset(name=args.dataset)
 split_edge = dataset.get_edge_split()
 
 device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
 
 graph = dataset[0]
-graph = dgl.add_self_loop(graph)
-graph = dgl.to_bidirected(graph, copy_ndata=True).to(device)
+graph = dgl.add_self_loop(graph).to(device)
+#graph = dgl.to_bidirected(graph, copy_ndata=True).to(device)
 
 train_pos_edge = split_edge['train']['edge'].to(device)
 valid_pos_edge = split_edge['valid']['edge'].to(device)
@@ -175,21 +180,33 @@ valid_neg_edge = split_edge['valid']['edge_neg'].to(device)
 test_pos_edge = split_edge['test']['edge'].to(device)
 test_neg_edge = split_edge['test']['edge_neg'].to(device)
 
+
 # Create negative samples for training
 neg_sampler = GlobalUniform(args.num_neg)
 
-pred = Hadamard_MLPPredictor(args.hidden, args.dropout).to(device)
+if args.pred == 'Hadamard':
+    pred = Hadamard_MLPPredictor(args.hidden, args.dropout, args.mlp_layers, args.mlp_res).to(device)
+elif args.pred == 'Dot':
+    pred = DotPredictor().to(device)
+elif args.pred == 'Lorentz':
+    pred = LorentzPredictor().to(device)
+else:
+    raise NotImplementedError
 
 embedding = torch.nn.Embedding(graph.num_nodes(), args.hidden).to(device)
 torch.nn.init.orthogonal_(embedding.weight)
 graph.ndata['feat'] = embedding.weight
 
 if args.model == 'GCN':
-    model = GCN(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.prop_step, args.residual, args.K).to(device)
+    model = GCN(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.prop_step, args.residual, args.conv).to(device)
 elif args.model == 'GCN_with_MLP':
-    model = GCN_with_MLP(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.prop_step, args.K).to(device)
+    model = GCN_with_MLP(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.prop_step).to(device)
 elif args.model == 'GCN_no_para':
-    model = GCN_no_para(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.prop_step, args.K).to(device)
+    model = GCN_no_para(graph.ndata['feat'].shape[1], args.hidden, args.dropout, args.prop_step, args.relu).to(device)
+elif args.model == 'GCN_with_feature':
+    model = GCN_with_feature(graph.ndata['feat'].shape[1], args.hidden, args.prop_step, args.dropout, args.residual).to(device)
+else:
+    raise NotImplementedError
 
 parameter = itertools.chain(model.parameters(), pred.parameters(), embedding.parameters())
 optimizer = torch.optim.Adam(parameter, lr=args.lr)
@@ -203,26 +220,22 @@ losses = []
 valid_list = []
 test_list = []
 
-if args.K > 0:
-    graph = graph.to('cpu')
-    train_neg_sampler = PerSourceUniform(args.K)
-    neg_g = train_neg_sampler(graph, torch.LongTensor(range(graph.num_edges())))
-    neg_g = dgl.graph(neg_g, num_nodes=graph.num_nodes())
-    neg_g = dgl.add_self_loop(neg_g)
-    neg_g = dgl.to_bidirected(neg_g, copy_ndata=True)
-    neg_g = neg_g.to(device)
-    graph = graph.to(device)
-else:
-    neg_g = None
 
 for epoch in range(args.epochs):
-    loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, neg_g)
+    loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
     losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
-    valid_results = eval(model, graph, valid_pos_edge, valid_neg_edge, evaluator, pred, neg_g)
+    valid_results = eval(model, graph, valid_pos_edge, valid_neg_edge, evaluator, pred)
     valid_list.append(valid_results[args.metric])
-    test_results = test(model, graph, test_pos_edge, test_neg_edge, evaluator, pred, neg_g)
+    if args.dataset == 'ogbl-collab':
+        graph_t = graph.clone()
+        u, v = valid_pos_edge.t()
+        graph_t.add_edges(u, v)
+        graph_t.add_edges(v, u)
+    else:
+        graph_t = graph
+    test_results = test(model, graph_t, test_pos_edge, test_neg_edge, evaluator, pred)
     test_list.append(test_results[args.metric])
     if valid_results[args.metric] > best_val:
         if args.dataset == 'ogbl-ddi' and epoch > 300:
@@ -240,8 +253,6 @@ for epoch in range(args.epochs):
     print(f"Epoch {epoch}, Loss: {loss:.4f}, Validation hit: {valid_results[args.metric]:.4f}, Test hit: {test_results[args.metric]:.4f}")
 
 print(f"Test hit: {final_test_result[args.metric]:.4f}")
-
-import matplotlib.pyplot as plt
 
 plt.figure()
 plt.plot(range(len(losses)), losses, label='loss')
