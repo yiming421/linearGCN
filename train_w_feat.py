@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader
 import tqdm
 import argparse
 from loss import auc_loss, hinge_auc_loss, log_rank_loss
-from model import GCN_with_feature, Hadamard_MLPPredictor
+from model import GCN_with_feature_2, Hadamard_MLPPredictor, GCN_with_feature, Dot_Predictor
+import time
 
 def parse():
     
@@ -20,13 +21,15 @@ def parse():
     parser.add_argument("--dataset", default='ogbl-collab', choices=['ogbl-collab', 'ogbl-citation2'], type=str)
     parser.add_argument("--lr", default=0.01, type=float)
     parser.add_argument("--prop_step", default=8, type=int)
-    parser.add_argument("--hidden", default=32, type=int)
+    parser.add_argument("--emb_hidden", default=64, type=int)
+    parser.add_argument("--gnn_hidden", default=64, type=int)
+    parser.add_argument("--mlp_hidden", default=64, type=int)
     parser.add_argument("--batch_size", default=8192, type=int)
     parser.add_argument("--dropout", default=0.05, type=float)
     parser.add_argument("--num_neg", default=1, type=int)
     parser.add_argument("--epochs", default=50, type=int)
-    parser.add_argument("--interval", default=50, type=int)
-    parser.add_argument("--step_lr_decay", action='store_true', default=False)
+    parser.add_argument("--interval", default=100, type=int)
+    parser.add_argument("--step_lr_decay", action='store_true', default=True)
     parser.add_argument("--metric", default='hits@20', type=str)
     parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--relu", action='store_true', default=False)
@@ -39,6 +42,10 @@ def parse():
     parser.add_argument("--drop_edge", action='store_true', default=False)
     parser.add_argument("--loss", default='bce', choices=['bce', 'auc', 'hauc', 'rank'], type=str)
     parser.add_argument("--residual", default=0, type=float)
+    parser.add_argument("--mlp_layers", default=2, type=int)
+    parser.add_argument("--pred", default='mlp', type=str)
+    parser.add_argument("--res", action='store_true', default=False)
+    parser.add_argument("--conv", default='GCN', type=str)
 
     args = parser.parse_args()
     return args
@@ -72,10 +79,10 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred):
             tei = torch.cat((tei, re_tei), dim=0)
             g_mask = dgl.graph((tei[:, 0], tei[:, 1]), num_nodes=g.num_nodes())
             g_mask = dgl.add_self_loop(g_mask)
-            h = model(g_mask, g.ndata['feat_2'], g.ndata['feat'])
+            h = model(g_mask, g.ndata['feat'], g.edata['weight'])
             mask[edge_index] = 1
         else:
-            h = model(g, g.ndata['feat_2'], g.ndata['feat'])
+            h = model(g, g.ndata['feat'], g.edata['weight'])
 
         pos_edge = train_pos_edge[edge_index]
         neg_train_edge = neg_sampler(g, pos_edge.t()[0])
@@ -95,7 +102,6 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred):
         
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(g.ndata['feat_2'], 1.0)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
         optimizer.step()
@@ -108,7 +114,7 @@ def test(model, g, pos_test_edge, neg_test_edge, evaluator, pred):
     pred.eval()
 
     with torch.no_grad():
-        h = model(g, g.ndata['feat_2'], g.ndata['feat'])
+        h = model(g, g.ndata['feat'], g.edata['weight'])
         dataloader = DataLoader(range(pos_test_edge.size(0)), args.batch_size)
         pos_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -143,7 +149,7 @@ def eval(model, g, pos_valid_edge, neg_valid_edge, evaluator, pred):
     pred.eval()
 
     with torch.no_grad():
-        h = model(g, g.ndata['feat_2'], g.ndata['feat'])
+        h = model(g, g.ndata['feat'], g.edata['weight'])
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
         pos_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -180,8 +186,33 @@ split_edge = dataset.get_edge_split()
 device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
 
 graph = dataset[0]
-graph = dgl.add_self_loop(graph)
-graph = dgl.to_bidirected(graph, copy_ndata=True).to(device)
+
+if args.dataset == 'ogbl-collab':
+    selected_year_index = torch.reshape(
+        (split_edge['train']['year'] >= 2010).nonzero(as_tuple=False), (-1,))
+    split_edge['train']['edge'] = split_edge['train']['edge'][selected_year_index]
+    split_edge['train']['weight'] = split_edge['train']['weight'][selected_year_index]
+    split_edge['train']['year'] = split_edge['train']['year'][selected_year_index]
+    train_edge_index = split_edge['train']['edge'].t()
+
+    u, v = split_edge['valid']['edge'].t()
+    re_vei = torch.stack((v, u), dim=0)
+
+    u, v = split_edge['train']['edge'].t()
+    re_tei = torch.stack((v, u), dim=0)
+
+    train_edge_index = torch.cat((train_edge_index, re_tei, re_vei, split_edge['valid']['edge'].t()), dim=1)
+    train_edge_weight = torch.cat((split_edge['train']['weight'], split_edge['train']['weight'], split_edge['valid']['weight'], split_edge['valid']['weight']), dim=0)
+
+    feat = graph.ndata['feat']
+    graph = dgl.graph((train_edge_index[0], train_edge_index[1]), num_nodes=graph.num_nodes())
+    graph.ndata['feat'] = feat
+    graph.edata['weight'] = train_edge_weight.to(torch.float32)
+    split_edge['train']['edge'] = torch.cat((split_edge['train']['edge'], split_edge['valid']['edge']), dim=0)
+    
+
+graph = dgl.add_self_loop(graph, fill_data=0)
+graph = graph.to(device)
 
 if args.dataset =="ogbl-citation2":
     for name in ['train','valid','test']:
@@ -199,16 +230,21 @@ valid_neg_edge = split_edge['valid']['edge_neg'].to(device)
 test_pos_edge = split_edge['test']['edge'].to(device)
 test_neg_edge = split_edge['test']['edge_neg'].to(device)
 
+embedding = torch.nn.Embedding(graph.num_nodes(), args.emb_hidden).to(device)
+torch.nn.init.orthogonal_(embedding.weight)
+graph.ndata['feat'] = torch.cat((embedding.weight, graph.ndata['feat']), dim=1)
+
 # Create negative samples for training
 neg_sampler = GlobalUniform(args.num_neg)
 
-pred = Hadamard_MLPPredictor(args.hidden, args.dropout).to(device)
+if args.pred == 'dot':
+    pred = Dot_Predictor().to(device)
+elif args.pred == 'mlp':
+    pred = Hadamard_MLPPredictor(args.gnn_hidden, args.mlp_hidden, args.dropout, args.mlp_layers, args.res).to(device)
+else:
+    raise NotImplementedError
 
-embedding = torch.nn.Embedding(graph.num_nodes(), args.hidden).to(device)
-torch.nn.init.orthogonal_(embedding.weight)
-graph.ndata['feat_2'] = embedding.weight
-
-model = GCN_with_feature(graph.ndata['feat'].shape[1], args.hidden, args.prop_step, args.dropout, args.residual).to(device)
+model = GCN_with_feature(graph.ndata['feat'].shape[1], args.gnn_hidden, args.prop_step, args.dropout, args.residual, args.relu, args.conv).to(device)
 
 parameter = itertools.chain(model.parameters(), pred.parameters(), embedding.parameters())
 optimizer = torch.optim.Adam(parameter, lr=args.lr)
@@ -224,33 +260,21 @@ test_list = []
 
 
 for epoch in range(args.epochs):
-    #loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
-    #losses.append(loss)
+    loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
+    losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
     valid_results = eval(model, graph, valid_pos_edge, valid_neg_edge, evaluator, pred)
     valid_list.append(valid_results[args.metric])
-    if args.dataset == 'ogbl-collab':
-        graph_t = graph.clone()
-        u, v = valid_pos_edge.t()
-        graph_t.add_edges(u, v)
-        graph_t.add_edges(v, u)
-    else:
-        graph_t = graph
-    test_results = test(model, graph_t, test_pos_edge, test_neg_edge, evaluator, pred)
-    if args.dataset == 'ogbl-collab':
-        del graph_t
+
+    test_results = test(model, graph, test_pos_edge, test_neg_edge, evaluator, pred)
     test_list.append(test_results[args.metric])
     if valid_results[args.metric] > best_val:
         best_val = valid_results[args.metric]
         best_epoch = epoch
         final_test_result = test_results
-    if args.dataset == 'ogbl-collab':
-        if epoch - best_epoch >= 200:
-            break
-    else:
-        if epoch - best_epoch >= 100:
-            break
+    if epoch - best_epoch >= 200:
+        break
     print(f"Epoch {epoch}, Loss: {loss:.4f}, Validation hit: {valid_results[args.metric]:.4f}, Test hit: {test_results[args.metric]:.4f}")
 
 print(f"Test hit: {final_test_result[args.metric]:.4f}")
